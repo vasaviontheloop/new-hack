@@ -127,15 +127,21 @@ async function askClaude(prompt, image) {
   return { text: (j.content || []).filter(b => b.type === "text").map(b => b.text).join("") };
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function geminiOnce(model, parts) {
+// Gemini 3 "thinks" at the highest level by default, which is slow. Word guessing doesn't need it.
+const GEMINI_THINKING = process.env.GEMINI_THINKING || "minimal";
+function geminiConfig(model, level) {
   const generationConfig = { maxOutputTokens: 2048, temperature: 0.6 };
   if (/^gemini-2\.5-flash/.test(model)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
-  const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 25000);
+  else if (/^gemini-[3-9]/.test(model) && level) generationConfig.thinkingConfig = { thinkingLevel: level };
+  return generationConfig;
+}
+async function geminiOnce(model, parts, msLeft, level) {
+  const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), Math.max(1000, msLeft));
   try {
     const r = await fetch(`${GEMINI_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
       method: "POST", signal: ctrl.signal,
       headers: { "x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig })
+      body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig: geminiConfig(model, level) })
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) return { error: j.error?.message || `Gemini error ${r.status}`, status: r.status };
@@ -143,26 +149,33 @@ async function geminiOnce(model, parts) {
     if (!text) return { error: `Gemini returned no text (${j.candidates?.[0]?.finishReason || j.promptFeedback?.blockReason || "unknown reason"}).`, status: 500 };
     return { text };
   } catch (e) {
-    return { error: e.name === "AbortError" ? "Gemini took too long to answer." : "Couldn't reach Gemini.", status: 504 };
+    return { error: e.name === "AbortError" ? "Gemini took too long to answer. Please try again." : "Couldn't reach Gemini.", status: 504 };
   } finally { clearTimeout(t); }
 }
-// Busy (429/503), timed out (504) or retired/unknown model (404, or 400 "no longer available") → try again / next model.
+// Busy (429/503) or timed out (504) → retry / next model. Retired or unknown model → next model.
 const retryable = o => [429, 500, 502, 503, 504].includes(o.status);
 const skipModel = o => retryable(o) || o.status === 404 || /no longer available|not found|not supported/i.test(o.error || "");
+const thinkingRejected = o => o.status === 400 && /thinking/i.test(o.error || "");
 async function askGemini(prompt, image) {
   if (!GEMINI_KEY) return { error: "GEMINI_API_KEY is not set on the server." };
   const parts = [];
   if (image) parts.push({ inline_data: { mime_type: "image/png", data: image } });
   parts.push({ text: prompt });
+  const deadline = Date.now() + 28000; // never keep the person waiting more than ~30s
   let last = { error: "No Gemini model configured." };
   for (const model of GEMINI_MODELS) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      last = await geminiOnce(model, parts);
+    let level = GEMINI_THINKING === "off" ? null : GEMINI_THINKING;
+    for (let attempt = 0; attempt < 3 && Date.now() < deadline - 1500; attempt++) {
+      const left = deadline - Date.now();
+      // Give the first model most of the time, but leave room for the backup.
+      const budget = model === GEMINI_MODELS[GEMINI_MODELS.length - 1] ? left : Math.min(left - 6000, 15000);
+      last = await geminiOnce(model, parts, budget, level);
       if (!last.error) return last;
-      if (!retryable(last)) break;
-      if (attempt === 0) await sleep(1200);
+      if (thinkingRejected(last) && level) { level = level === "minimal" ? "low" : null; continue; } // model doesn't accept that level
+      if (!retryable(last) || last.status === 504 || attempt >= 1) break; // one quick retry when busy
+      await sleep(700);
     }
-    if (!skipModel(last)) break;
+    if (!skipModel(last) || Date.now() >= deadline - 1500) break;
     console.warn(`Gemini model ${model} failed (${last.error}); trying the next one.`);
   }
   return { error: last.error };
