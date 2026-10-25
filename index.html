@@ -527,7 +527,7 @@ window.__ICONS={"search":"<path d=\"m21 21-4.34-4.34\" /> <circle cx=\"11\" cy=\
     }
     const body = { prompt }; if (image) body.image = await blobToB64(image);
     const res = await fetch("/api/ai", { method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify(body) });
-    if (!res.ok) throw new Error("Server said " + res.status);
+    if (!res.ok) { let m = "Server said " + res.status; try { const j = await res.json(); if (j.error) m = j.error; } catch {} throw new Error(m); }
     return parseJSON((await res.json()).text);
   }
 

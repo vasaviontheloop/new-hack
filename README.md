@@ -22,9 +22,12 @@ Most AAC apps give you a fixed grid of preset words. That works for "water" and 
 
 Design: editorial look (Instrument Serif headings, line icons, ink and deep-green palette) with accessibility built in: Atkinson Hyperlegible body font, 50px+ touch targets, an icon plus a short label on every option, low reading load, keyboard focus states, reduced-motion support.
 
+## AI provider
+WordReach works with **Google Gemini** (free tier, default model `gemini-2.5-flash`, change with `GEMINI_MODEL`) or **Anthropic Claude**. If `GEMINI_API_KEY` is set it uses Gemini; otherwise Claude. Gemini's free tier is rate-limited and Google may use free-tier data to improve its products, so don't enter real patient details on the free tier.
+
 ## Run it on a laptop (recommended for the demo)
 1. Install **Node.js 18 or newer** from nodejs.org (the LTS version).
-2. Unzip the project. In the folder, copy `.env.example` to a new file named `.env` and paste your Anthropic key into it.
+2. Unzip the project. In the folder, copy `.env.example` to a new file named `.env` and paste in an AI key: a **free Gemini key** from aistudio.google.com (`GEMINI_API_KEY`), or an Anthropic key (`ANTHROPIC_API_KEY`, needs API credit).
 3. Open a terminal in the folder and run `npm start`.
 4. Open **http://localhost:3000** in Chrome.
 
@@ -37,7 +40,7 @@ Hosted servers can wipe local files on restart, so the hosted version should kee
 2. **GitHub:** upload these files to a new repo.
 3. **Render:** New → Web Service → pick the repo. Build command `npm install`, start command `npm start`, Free plan.
 4. Under **Environment**, add:
-   - `ANTHROPIC_API_KEY`: your Anthropic key
+   - `GEMINI_API_KEY`: your free Gemini key (or `ANTHROPIC_API_KEY` for Claude)
    - `SESSION_SECRET`: any long random text (keeps people signed in across restarts)
    - `SUPABASE_URL`: the Project URL
    - `SUPABASE_SECRET_KEY`: the `sb_secret_...` key

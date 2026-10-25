@@ -1,4 +1,5 @@
 // WordReach server. Node 18+, no dependencies.
+// AI: set GEMINI_API_KEY (free tier at aistudio.google.com) or ANTHROPIC_API_KEY.
 //
 //   Put your keys in a .env file (copy .env.example), then run:  npm start
 //
@@ -22,13 +23,20 @@ try {
 const PORT = process.env.PORT || 3000;
 const MODEL = process.env.MODEL || "claude-sonnet-5-5";
 const KEY = process.env.ANTHROPIC_API_KEY;
+const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_BASE = (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com").replace(/\/$/, "");
+// Gemini is used when GEMINI_API_KEY is set (or AI_PROVIDER=gemini); otherwise Claude.
+const PROVIDER = (process.env.AI_PROVIDER || (GEMINI_KEY ? "gemini" : "anthropic")).toLowerCase();
 const SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex");
 const SB_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SB_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
-const DATA_FILE = path.join(process.env.DATA_DIR || path.join(__dirname, "data"), "users.json");
+// Vercel only allows writing to /tmp (temporary). Use Supabase for permanent accounts there.
+const DATA_FILE = path.join(process.env.DATA_DIR || (process.env.VERCEL ? "/tmp/wordreach" : path.join(__dirname, "data")), "users.json");
 const html = () => fs.readFileSync(path.join(__dirname, "index.html"));
 
-if (!KEY) console.warn("Warning: ANTHROPIC_API_KEY is not set. AI features will fail.");
+if (PROVIDER === "gemini" ? !GEMINI_KEY : !KEY) console.warn(`Warning: ${PROVIDER === "gemini" ? "GEMINI_API_KEY" : "ANTHROPIC_API_KEY"} is not set. AI features will fail.`);
+console.log("AI provider:", PROVIDER === "gemini" ? `Gemini (${GEMINI_MODEL})` : `Claude (${MODEL})`);
 if (!process.env.SESSION_SECRET) console.warn("Warning: SESSION_SECRET is not set. Everyone is signed out on restart.");
 console.log("Storage:", SB_URL && SB_KEY ? "Supabase" : `local file (${DATA_FILE})`);
 
@@ -101,6 +109,41 @@ function fail(email) { const f = fails.get(email) || { n: 0, until: 0 }; f.n++; 
 const aiHits = new Map(); // ip -> [timestamps]
 function aiLimited(ip) { const now = Date.now(), arr = (aiHits.get(ip) || []).filter(t => now - t < 3600e3); arr.push(now); aiHits.set(ip, arr); return arr.length > 120; }
 
+// ---------- AI providers ----------
+async function askClaude(prompt, image) {
+  if (!KEY) return { error: "ANTHROPIC_API_KEY is not set on the server." };
+  const content = [];
+  if (image) content.push({ type: "image", source: { type: "base64", media_type: "image/png", data: image } });
+  content.push({ type: "text", text: prompt });
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "x-api-key": KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify({ model: MODEL, max_tokens: 1024, messages: [{ role: "user", content }] })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return { error: j.error?.message || `Claude error ${r.status}` };
+  return { text: (j.content || []).filter(b => b.type === "text").map(b => b.text).join("") };
+}
+async function askGemini(prompt, image) {
+  if (!GEMINI_KEY) return { error: "GEMINI_API_KEY is not set on the server." };
+  const parts = [];
+  if (image) parts.push({ inline_data: { mime_type: "image/png", data: image } });
+  parts.push({ text: prompt });
+  const generationConfig = { maxOutputTokens: 2048, temperature: 0.6 };
+  // 2.5 Flash "thinks" by default; turning it off keeps answers fast for live use.
+  if (/^gemini-2\.5-flash/.test(GEMINI_MODEL)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  const r = await fetch(`${GEMINI_BASE}/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`, {
+    method: "POST",
+    headers: { "x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return { error: j.error?.message || `Gemini error ${r.status}` };
+  const text = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("");
+  if (!text) return { error: `Gemini returned no text (${j.candidates?.[0]?.finishReason || j.promptFeedback?.blockReason || "unknown reason"}).` };
+  return { text };
+}
+
 // ---------- HTTP ----------
 function readBody(req, limit = 4 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
@@ -164,17 +207,10 @@ http.createServer(async (req, res) => {
       if (aiLimited(ip)) return send(res, 429, { error: "Too many requests. Please slow down." });
       const { prompt, image } = await readBody(req);
       if (typeof prompt !== "string" || !prompt || prompt.length > 20000) return send(res, 400, { error: "prompt required" });
-      const content = [];
-      if (typeof image === "string" && image) content.push({ type: "image", source: { type: "base64", media_type: "image/png", data: image } });
-      content.push({ type: "text", text: prompt });
-      const r = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "x-api-key": KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-        body: JSON.stringify({ model: MODEL, max_tokens: 1024, messages: [{ role: "user", content }] })
-      });
-      const j = await r.json();
-      if (!r.ok) return send(res, 502, { error: j.error?.message || "upstream error" });
-      return send(res, 200, { text: (j.content || []).filter(b => b.type === "text").map(b => b.text).join("") });
+      const img = typeof image === "string" && image ? image : null;
+      const out = PROVIDER === "gemini" ? await askGemini(prompt, img) : await askClaude(prompt, img);
+      if (out.error) return send(res, 502, { error: out.error });
+      return send(res, 200, { text: out.text });
     }
 
     res.writeHead(404); res.end("Not found");
