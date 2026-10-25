@@ -24,7 +24,9 @@ const PORT = process.env.PORT || 3000;
 const MODEL = process.env.MODEL || "claude-sonnet-5-5";
 const KEY = process.env.ANTHROPIC_API_KEY;
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+// One or more models, comma-separated. If the first is busy or unavailable, the next is tried.
+const GEMINI_MODELS = (process.env.GEMINI_MODEL || "gemini-3.8-flash,gemini-3.1-flash-lite").split(",").map(m => m.trim()).filter(Boolean);
+const GEMINI_MODEL = GEMINI_MODELS[0];
 const GEMINI_BASE = (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com").replace(/\/$/, "");
 // Gemini is used when GEMINI_API_KEY is set (or AI_PROVIDER=gemini); otherwise Claude.
 const PROVIDER = (process.env.AI_PROVIDER || (GEMINI_KEY ? "gemini" : "anthropic")).toLowerCase();
@@ -36,7 +38,7 @@ const DATA_FILE = path.join(process.env.DATA_DIR || (process.env.VERCEL ? "/tmp/
 const html = () => fs.readFileSync(path.join(__dirname, "index.html"));
 
 if (PROVIDER === "gemini" ? !GEMINI_KEY : !KEY) console.warn(`Warning: ${PROVIDER === "gemini" ? "GEMINI_API_KEY" : "ANTHROPIC_API_KEY"} is not set. AI features will fail.`);
-console.log("AI provider:", PROVIDER === "gemini" ? `Gemini (${GEMINI_MODEL})` : `Claude (${MODEL})`);
+console.log("AI provider:", PROVIDER === "gemini" ? `Gemini (${GEMINI_MODELS.join(" → ")})` : `Claude (${MODEL})`);
 if (!process.env.SESSION_SECRET) console.warn("Warning: SESSION_SECRET is not set. Everyone is signed out on restart.");
 console.log("Storage:", SB_URL && SB_KEY ? "Supabase" : `local file (${DATA_FILE})`);
 
@@ -124,24 +126,46 @@ async function askClaude(prompt, image) {
   if (!r.ok) return { error: j.error?.message || `Claude error ${r.status}` };
   return { text: (j.content || []).filter(b => b.type === "text").map(b => b.text).join("") };
 }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function geminiOnce(model, parts) {
+  const generationConfig = { maxOutputTokens: 2048, temperature: 0.6 };
+  if (/^gemini-2\.5-flash/.test(model)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 25000);
+  try {
+    const r = await fetch(`${GEMINI_BASE}/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: "POST", signal: ctrl.signal,
+      headers: { "x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig })
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) return { error: j.error?.message || `Gemini error ${r.status}`, status: r.status };
+    const text = (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || "").join("");
+    if (!text) return { error: `Gemini returned no text (${j.candidates?.[0]?.finishReason || j.promptFeedback?.blockReason || "unknown reason"}).`, status: 500 };
+    return { text };
+  } catch (e) {
+    return { error: e.name === "AbortError" ? "Gemini took too long to answer." : "Couldn't reach Gemini.", status: 504 };
+  } finally { clearTimeout(t); }
+}
+// Busy (429/503), timed out (504) or retired/unknown model (404, or 400 "no longer available") → try again / next model.
+const retryable = o => [429, 500, 502, 503, 504].includes(o.status);
+const skipModel = o => retryable(o) || o.status === 404 || /no longer available|not found|not supported/i.test(o.error || "");
 async function askGemini(prompt, image) {
   if (!GEMINI_KEY) return { error: "GEMINI_API_KEY is not set on the server." };
   const parts = [];
   if (image) parts.push({ inline_data: { mime_type: "image/png", data: image } });
   parts.push({ text: prompt });
-  const generationConfig = { maxOutputTokens: 2048, temperature: 0.6 };
-  // 2.5 Flash "thinks" by default; turning it off keeps answers fast for live use.
-  if (/^gemini-2\.5-flash/.test(GEMINI_MODEL)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
-  const r = await fetch(`${GEMINI_BASE}/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`, {
-    method: "POST",
-    headers: { "x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig })
-  });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) return { error: j.error?.message || `Gemini error ${r.status}` };
-  const text = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("");
-  if (!text) return { error: `Gemini returned no text (${j.candidates?.[0]?.finishReason || j.promptFeedback?.blockReason || "unknown reason"}).` };
-  return { text };
+  let last = { error: "No Gemini model configured." };
+  for (const model of GEMINI_MODELS) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      last = await geminiOnce(model, parts);
+      if (!last.error) return last;
+      if (!retryable(last)) break;
+      if (attempt === 0) await sleep(1200);
+    }
+    if (!skipModel(last)) break;
+    console.warn(`Gemini model ${model} failed (${last.error}); trying the next one.`);
+  }
+  return { error: last.error };
 }
 
 // ---------- HTTP ----------
